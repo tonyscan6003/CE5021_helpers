@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ce5021"
+version = "2026.1"
+description = "Helper functions for the CE5021 deep learning assignments"
+readme = "README.md"
+requires-python = ">=3.9"
+# All of these are preinstalled on Google Colab, so installing the package
+# there only adds the ce5021 code itself.
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "matplotlib",
+    "scikit-learn",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+medmnist = ["medmnist"]
+
+[tool.setuptools]
+packages = ["ce5021"]
