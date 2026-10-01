@@ -1,6 +1,7 @@
 """Helper functions for the CE5021 deep learning assignments.
 
     ce5021.data   datasets, data loaders, image (de)normalisation
+    ce5021.models pre-trained networks for transfer learning, parameters and FLOPs
     ce5021.train  device selection, evaluation, recording training history
     ce5021.plots  images, predictions, confusion matrix, TensorBoard logs
 

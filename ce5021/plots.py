@@ -73,6 +73,18 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=False):
     plt.show()
 
 
+def plot_class_counts(class_counts, class_names=None, title="Training images per class"):
+    """Bar chart of the number of images in each class (shows class imbalance)."""
+    names = class_names or [str(i) for i in range(len(class_counts))]
+    fig, ax = plt.subplots(figsize=(max(5, 0.9 * len(names)), 3))
+    bars = ax.bar(names, class_counts, color="tab:blue")
+    ax.bar_label(bars)
+    ax.set(title=title, ylabel="images")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_tensorboard_logs(logdir="runs"):
     """Plot every scalar logged with a TensorBoard SummaryWriter under ``logdir``.
 

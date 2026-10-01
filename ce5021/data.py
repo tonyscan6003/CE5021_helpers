@@ -12,7 +12,7 @@ import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import datasets
 
 # Mean and standard deviation of the ImageNet training images (per RGB channel).
@@ -74,16 +74,60 @@ def _label_to_int(label):
     return int(label[0])
 
 
+def stratified_subset(labels, n, seed=0):
+    """Indices of ``n`` items chosen at random with the same class proportions as ``labels``.
+
+    Every class keeps at least one item. The same ``seed`` always gives the same subset.
+    """
+    labels = np.asarray(labels).reshape(-1)
+    if n is None or n >= len(labels):
+        return np.arange(len(labels))
+    rng = np.random.default_rng(seed)
+    classes, counts = np.unique(labels, return_counts=True)
+    if n < len(classes):
+        raise ValueError(f"n={n} is less than the number of classes ({len(classes)})")
+    take = np.maximum(1, np.floor(counts * n / len(labels)).astype(int))
+    # correct the rounding on the largest classes so exactly n are taken
+    order = np.argsort(-counts)
+    while take.sum() != n:
+        step = 1 if take.sum() < n else -1
+        for i in order:
+            if take.sum() == n:
+                break
+            if take[i] + step >= 1:
+                take[i] += step
+    chosen = [rng.choice(np.flatnonzero(labels == c), k, replace=False)
+              for c, k in zip(classes, take)]
+    return np.sort(np.concatenate(chosen))
+
+
+def class_weights(class_counts):
+    """Loss weights that give every class the same total weight: n_images / (n_classes * count).
+
+    Use with ``nn.CrossEntropyLoss(weight=class_weights(info["train_class_counts"]).to(device))``
+    so mistakes on rare classes cost more than mistakes on common ones.
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    return counts.sum() / (len(counts) * counts)
+
+
 def medmnist_loaders(data_flag, train_transform, test_transform, batch_size=64,
-                     size=28, root="data", num_workers=2):
+                     size=28, n_train=None, balanced_sampling=False, seed=0,
+                     root="data", num_workers=2):
     """Download a MedMNIST dataset and return (train_loader, val_loader, test_loader, info).
 
     Args:
-        data_flag: dataset name in lower case, e.g. "bloodmnist", "pneumoniamnist".
+        data_flag: dataset name in lower case, e.g. "dermamnist".
         size: image size, 28 (fast) or 64, 128, 224 (slower, more detail).
+        n_train: number of training images to use (None: all of them). A random
+            subset with the same class proportions, fixed by ``seed``.
+        balanced_sampling: draw training images so every class is seen equally
+            often (rare images are repeated). An epoch is still ``n_train`` images.
 
-    ``info`` is a dict with keys ``task``, ``n_channels``, ``n_classes`` and
-    ``class_names``. Only multi-class and binary datasets are supported.
+    ``info`` is a dict with keys ``task``, ``n_channels``, ``n_classes``,
+    ``class_names``, ``n_train`` and ``train_class_counts``. Only multi-class
+    and binary datasets are supported. The validation and test sets are
+    always complete.
     """
     import medmnist   # installed separately: %pip install medmnist
 
@@ -92,14 +136,28 @@ def medmnist_loaders(data_flag, train_transform, test_transform, batch_size=64,
         raise ValueError(f"{data_flag} is a '{meta['task']}' task; "
                          "choose a multi-class or binary dataset")
     DataClass = getattr(medmnist, meta["python_class"])
+    n_classes = len(meta["label"])
 
     def split(name, transform):
         return DataClass(split=name, transform=transform, target_transform=_label_to_int,
                          download=True, size=size, root=root, mmap_mode="r")
 
     os.makedirs(root, exist_ok=True)
-    train_loader = DataLoader(split("train", train_transform), batch_size=batch_size,
-                              shuffle=True, num_workers=num_workers)
+    train_data = split("train", train_transform)
+    indices = stratified_subset(train_data.labels, n_train, seed)
+    train_labels = np.asarray(train_data.labels).reshape(-1)[indices]
+    counts = np.bincount(train_labels, minlength=n_classes)
+    train_data = Subset(train_data, indices)
+
+    if balanced_sampling:
+        weights = 1.0 / counts[train_labels]
+        sampler = WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double),
+                                        num_samples=len(indices), replacement=True)
+        train_loader = DataLoader(train_data, batch_size=batch_size, sampler=sampler,
+                                  num_workers=num_workers)
+    else:
+        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True,
+                                  num_workers=num_workers)
     val_loader = DataLoader(split("val", test_transform), batch_size=batch_size,
                             num_workers=num_workers)
     test_loader = DataLoader(split("test", test_transform), batch_size=batch_size,
@@ -108,7 +166,9 @@ def medmnist_loaders(data_flag, train_transform, test_transform, batch_size=64,
     info = {
         "task": meta["task"],
         "n_channels": meta["n_channels"],
-        "n_classes": len(meta["label"]),
-        "class_names": [meta["label"][str(i)] for i in range(len(meta["label"]))],
+        "n_classes": n_classes,
+        "class_names": [meta["label"][str(i)] for i in range(n_classes)],
+        "n_train": len(indices),
+        "train_class_counts": counts.tolist(),
     }
     return train_loader, val_loader, test_loader, info
