@@ -227,6 +227,17 @@ class History:
         return result
 
 
+def challenge_score(balanced_acc, compute_tflop, reference_tflop=50, exponent=-0.07):
+    """Score of the transfer-learning challenge (Assignment 2).
+
+        S = test balanced accuracy (%) x (training compute / 50 TFLOP) ** -0.07
+
+    The compute penalty is the soft constraint used in MnasNet/EfficientNet
+    architecture search: doubling the compute lowers the score by about 5 %.
+    """
+    return balanced_acc * (compute_tflop / reference_tflop) ** exponent
+
+
 @torch.no_grad()
 def final_evaluation(model, history, train_loader, test_loader, device):
     """Evaluate the trained model once on the test set and print the result block.
@@ -237,6 +248,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
 
         training compute = training FLOPs per image x images per epoch x epochs
 
+    The block includes the challenge score S (see ``challenge_score``).
     Returns a dict with all values shown in the block.
     """
     import datetime
@@ -264,6 +276,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
     best = history.best_index() if epochs else None
     compute = cost["train_flops"] * images_per_epoch * epochs
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else str(device)
+    balanced_acc = 100 * balanced_accuracy_score(y_true, y_pred)
 
     result = {
         "run": history.name,
@@ -275,7 +288,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
         "epochs trained": epochs,
         "weights from epoch": history.epoch[best] + 1 if epochs else None,
         "val balanced acc (%)": round(history._score()[best], 1) if epochs else None,
-        "TEST balanced acc (%)": round(100 * balanced_accuracy_score(y_true, y_pred), 1),
+        "TEST balanced acc (%)": round(balanced_acc, 1),
         "test acc (%)": round(100 * float((y_true == y_pred).mean()), 1),
         "test AUC": round(float(auc), 3),
         "parameters": format_count(cost["params"]),
@@ -283,6 +296,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
         "inference GFLOP per image": round(cost["inference_flops"] / 1e9, 3),
         "training GFLOP per image": round(cost["train_flops"] / 1e9, 3),
         "TRAINING COMPUTE (TFLOP)": round(compute / 1e12, 2),
+        "SCORE S": round(challenge_score(balanced_acc, compute / 1e12), 1) if compute else None,
         "settings": history.config,
         "evaluated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                      + f" on {gpu}",
