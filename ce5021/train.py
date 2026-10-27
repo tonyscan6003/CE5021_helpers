@@ -255,7 +255,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
 
     from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 
-    from .models import compute_cost, format_count
+    from .models import compute_cost, format_count, strategy_text
 
     model.eval()
     y_true, probs = [], []
@@ -281,7 +281,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
     result = {
         "run": history.name,
         "model": cost.get("arch", type(model).__name__),
-        "strategy": cost.get("strategy"),
+        "strategy": strategy_text(cost),
         "head": cost.get("head"),
         "image size": image_size,
         "training images per epoch": images_per_epoch,

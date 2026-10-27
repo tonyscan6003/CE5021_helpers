@@ -13,7 +13,8 @@ the *strategy* decides which layers are trained:
 
     "head"     only the new head; the pre-trained layers are frozen
                (the network is used as a fixed feature extractor)
-    "partial"  the last stage of the network and the head
+    "partial"  the last stage of the network and the head (or, with
+               train_from, every block from a chosen one onwards)
     "full"     every layer (fine-tuning), starting from the ImageNet weights
     "scratch"  every layer, starting from random weights (no transfer learning)
 """
@@ -62,7 +63,8 @@ def make_head(in_features, n_classes, head="linear", hidden=256, dropout=0.5):
     raise ValueError(f"head must be one of {HEADS}, not {head!r}")
 
 
-def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dropout=0.5):
+def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dropout=0.5,
+                train_from=None):
     """Load a torchvision classifier, replace its last layer and choose what is trained.
 
     Args:
@@ -70,6 +72,10 @@ def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dro
         n_classes: number of classes in your dataset.
         strategy: "head", "partial", "full" or "scratch" (see the module help).
         head: "linear" or "mlp"; ``hidden`` and ``dropout`` set up the mlp head.
+        train_from: with ``strategy="partial"`` only: the name of the first
+            block that is trained (e.g. "layer3" or "features.5"); that block,
+            every block after it and the head are trained. ``None`` starts at
+            the last stage of the network. ``show_layers(model)`` lists the names.
 
     The ImageNet weights are downloaded the first time (not for "scratch").
     Parameters that are not trained have ``requires_grad = False``.
@@ -79,6 +85,9 @@ def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dro
     if strategy not in STRATEGIES:
         raise ValueError(f"strategy must be one of {STRATEGIES}, not {strategy!r}")
     spec = ARCHITECTURES[arch]
+    if train_from is not None and strategy != "partial":
+        raise ValueError(f'train_from is only used with strategy="partial", not {strategy!r}')
+    start = (train_from or spec["last_stage"]) if strategy == "partial" else None
 
     weights = None if strategy == "scratch" else "DEFAULT"
     model = getattr(tv_models, arch)(weights=weights)
@@ -88,15 +97,57 @@ def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dro
 
     # Choose the trained parameters. named_parameters() lists them in network
     # order, so "partial" trains everything from the start of the last stage on.
+    if start is not None and not any(n.startswith(start + ".") for n, _ in model.named_parameters()):
+        raise ValueError(f"{arch} has no block named {start!r}; "
+                         "show_layers(model) lists the names of its blocks")
     trainable = strategy in ("full", "scratch")
     for name, param in model.named_parameters():
-        if strategy == "partial" and name.startswith(spec["last_stage"] + "."):
+        if start is not None and name.startswith(start + "."):
             trainable = True
         param.requires_grad = trainable or name.startswith(spec["head"] + ".")
 
     model.ce5021_info = {"arch": arch, "strategy": strategy, "head": head,
-                         "min_size": spec["min_size"]}
+                         "train_from": start, "min_size": spec["min_size"]}
     return model
+
+
+def strategy_text(info):
+    """ "partial from layer3" for a partial model, otherwise just the strategy."""
+    strategy = info.get("strategy")
+    return f"{strategy} from {info['train_from']}" if info.get("train_from") else strategy
+
+
+def show_layers(model):
+    """List the blocks of a model built with ``build_model``, in network order.
+
+    Each row is a block name (usable as ``train_from``), its number of
+    parameters and whether it is trained. The blocks are listed at the same
+    level as the network's default ``partial`` starting point, so every name
+    shown is a valid ``train_from``. ``print(model)`` shows the full structure.
+    """
+    info = getattr(model, "ce5021_info", None)
+    if info is None:
+        raise ValueError("show_layers needs a model made with build_model")
+    spec = ARCHITECTURES[info["arch"]]
+    depth = len(spec["last_stage"].split("."))
+    blocks = {}                                   # block name -> [parameters, trained]
+    for name, param in model.named_parameters():
+        parts = name.split(".")[:-1]              # drop "weight" / "bias"
+        block = ".".join(parts[:depth])
+        entry = blocks.setdefault(block, [0, False])
+        entry[0] += param.numel()
+        entry[1] = entry[1] or param.requires_grad
+    width = max(len(b) for b in blocks)
+    print(f"{info['arch']}, strategy {strategy_text(info)}")
+    print(f"  {'block':<{width}}  {'parameters':>11}  trained")
+    for block, (count, trained) in blocks.items():
+        notes = []
+        if block == spec["last_stage"]:
+            notes.append('default start of "partial"')
+        if block == spec["head"] or block.startswith(spec["head"] + ".") or spec["head"].startswith(block + "."):
+            notes.append("head")
+        note = f"   <- {', '.join(notes)}" if notes else ""
+        print(f"  {block:<{width}}  {format_count(count):>11}  {'yes' if trained else 'no ':<7}{note}")
 
 
 def format_count(n):
@@ -171,7 +222,7 @@ def compute_cost(model, image_size, device="cpu", verbose=True):
     cost = {"params": total, "trainable_params": trainable, "inference_flops": inference,
             "train_flops": train, "image_size": image_size, **info}
     if verbose:
-        name = f"{info['arch']} (strategy {info['strategy']}, head {info['head']})" if info else "model"
+        name = f"{info['arch']} (strategy {strategy_text(info)}, head {info['head']})" if info else "model"
         print(f"{name}, {image_size}x{image_size} images")
         print(f"  parameters : {format_count(total)} total, {format_count(trainable)} trained")
         print(f"  inference  : {inference / 1e9:.3f} GFLOP per image")

@@ -17,7 +17,7 @@ In Google Colab (the first cell of each assignment does this for you):
 | Module | Functions |
 |---|---|
 | `ce5021.data` | `cifar10_loaders`, `medmnist_loaders` (image size, number of training images, balanced sampling), `stratified_subset`, `class_weights`, `denormalize`, `IMAGENET_MEAN`, `IMAGENET_STD`, `CIFAR10_CLASSES` |
-| `ce5021.models` | `build_model` (pre-trained torchvision classifier with a new head; strategies `head`, `partial`, `full`, `scratch`), `compute_cost` (parameters and FLOPs), `ARCHITECTURES` |
+| `ce5021.models` | `build_model` (pre-trained torchvision classifier with a new head; strategies `head`, `partial`, `full`, `scratch`; `train_from` chooses where `partial` starts), `show_layers` (blocks of a model in order, trained or frozen), `compute_cost` (parameters and FLOPs), `ARCHITECTURES` |
 | `ce5021.train` | `get_device`, `evaluate`, `evaluate_balanced`, `predict`, `History` (`log`, `is_best`, `plot`, `summary`), `final_evaluation` |
 | `ce5021.plots` | `show_batch`, `show_images`, `show_predictions`, `plot_class_counts`, `plot_confusion_matrix`, `plot_tensorboard_logs` |
 | `ce5021.detection` | `pennfudan_loaders` (letterboxed Penn-Fudan, boxes per image), `build_backbone` (ResNet cut after a stage: features, channels, stride), `predict_detections`, `evaluate_detector`, `detection_metrics` (COCO AP, AP50, AP75), `error_analysis`, `worst_images`, `show_boxes`, `show_maps`, `show_detections`, `plot_precision_recall`, `DetectionHistory`, `final_detection_result` |
