@@ -1,22 +1,25 @@
-"""Object detection: the Penn-Fudan dataset, backbones, evaluation (AP) and debugging plots.
+"""Object detection: the Penn-Fudan dataset, single-stage detector designs, evaluation (AP)
+and debugging plots.
 
-The detector itself (its head, target encoding, loss and decoding) and the
-training loop are written in the notebook. These helpers are the parts that
-stay the same for every single-stage design::
+The training loop is written in the notebook. The detector is built from a
+choice of design options (network, target encoding, loss, decoding), each a
+short function in this module that can be read with ``function??``::
 
     train_loader, val_loader, test_loader = pennfudan_loaders(image_size, train_tf, test_tf)
-    backbone, channels, stride = build_backbone("resnet18", "layer4")
+    model = build_detector(stride=16, targets="gaussian", score_loss="focal", decoding="peaks")
 
-    output = model(images)                    # any tensor (or dict of tensors)
-    detections = decode(output)               # list of {"boxes": [N, 4], "scores": [N]}
+    output = model(images)                                    # [B, 5, H, W]
+    losses = model.loss(output, model.encode_targets(boxes, output.shape[-2:]))
+    detections = model.decode(output)         # list of {"boxes": [N, 4], "scores": [N]}
 
-    preds, gts = predict_detections(model, val_loader, decode, device)
+    preds, gts = predict_detections(model, val_loader, model.decode, device)
     metrics = detection_metrics(preds, gts)   # AP, AP50, AP75, recall
 
 Boxes are always ``[x1, y1, x2, y2]`` in pixels of the (letterboxed) input image.
 """
 
 import datetime
+import math
 import os
 import time
 import zipfile
@@ -24,6 +27,7 @@ import zipfile
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -189,6 +193,309 @@ def build_backbone(arch="resnet18", stop_at="layer4", pretrained=True):
     last = layers[-1][-1]
     channels = (last.conv3 if hasattr(last, "conv3") else last.conv2).out_channels
     return backbone, channels, _STAGES[stop_at]
+
+
+# ---------------------------------------------------------------------------
+# Detector designs
+# ---------------------------------------------------------------------------
+#
+# A single-stage detector is defined by four parts, each with a few options:
+#
+#   network          backbone, stride and neck   -> output maps [B, 5, H, W]
+#   target encoding  TARGET_ENCODINGS            true boxes -> target maps [B, 5, H, W]
+#   loss             SCORE_LOSSES (+ box_loss)   output and target maps -> loss terms
+#   decoding         DECODINGS                   output maps -> boxes with scores
+#
+# The 5 channels of every grid cell are: score (is a pedestrian centre in this
+# cell?), x and y offset of the centre inside the cell (0 to 1), and the log of
+# the box width and height in cells. ``build_detector`` combines the options.
+
+STRIDES = (32, 16, 8, 4)
+NECKS = ("upsample", "fpn", "cut")
+_STAGE_FOR_STRIDE = {32: "layer4", 16: "layer3", 8: "layer2", 4: "layer1"}
+
+
+def encode_centre_cell(boxes, grid_size, stride):
+    """Target maps [B, 5, H, W]: only the cell containing a pedestrian's centre is responsible for it.
+
+    Its score target is 1 (all other cells 0); its box channels hold the centre
+    position inside the cell and the log of the box size in cells. This is the
+    encoding of the original YOLO.
+    """
+    H, W = grid_size
+    targets = torch.zeros(len(boxes), 5, H, W)
+    for b, image_boxes in enumerate(boxes):
+        for x1, y1, x2, y2 in image_boxes.tolist():
+            cx, cy = (x1 + x2) / 2 / stride, (y1 + y2) / 2 / stride     # centre, in cells
+            w, h = (x2 - x1) / stride, (y2 - y1) / stride               # size, in cells
+            row, col = min(int(cy), H - 1), min(int(cx), W - 1)          # cell containing the centre
+            targets[b, :, row, col] = torch.tensor(
+                [1.0, cx - col, cy - row, math.log(w), math.log(h)])
+    return targets
+
+
+def encode_gaussian(boxes, grid_size, stride):
+    """Target maps [B, 5, H, W] with a soft score target: a Gaussian around each centre.
+
+    The centre cell has score target 1 and is responsible for the box, as in
+    ``encode_centre_cell``. Its neighbours get targets between 0 and 1 that
+    fall off with distance (the spread grows with the box size), so cells that
+    look almost the same as the centre are not trained as clear negatives.
+    This is the encoding of CenterNet.
+    """
+    H, W = grid_size
+    targets = torch.zeros(len(boxes), 5, H, W)
+    rows = torch.arange(H).view(-1, 1).float()
+    cols = torch.arange(W).view(1, -1).float()
+    for b, image_boxes in enumerate(boxes):
+        for x1, y1, x2, y2 in image_boxes.tolist():
+            cx, cy = (x1 + x2) / 2 / stride, (y1 + y2) / 2 / stride
+            w, h = (x2 - x1) / stride, (y2 - y1) / stride
+            row, col = min(int(cy), H - 1), min(int(cx), W - 1)
+            sx, sy = max(0.5, w / 6), max(0.5, h / 6)                   # spread grows with the box
+            gaussian = torch.exp(-((cols - col) ** 2 / (2 * sx ** 2) + (rows - row) ** 2 / (2 * sy ** 2)))
+            targets[b, 0] = torch.maximum(targets[b, 0], gaussian)      # 1 exactly at the centre cell
+            targets[b, 1:, row, col] = torch.tensor([cx - col, cy - row, math.log(w), math.log(h)])
+    return targets
+
+
+def bce_score_loss(score_logits, score_targets):
+    """Binary cross-entropy of the score in every cell, averaged over all cells.
+
+    Nearly all cells contain no pedestrian centre, so the average is dominated
+    by easy background cells.
+    """
+    return F.binary_cross_entropy_with_logits(score_logits, score_targets)
+
+
+def focal_score_loss(score_logits, score_targets):
+    """Penalty-reduced focal loss of the score (CenterNet), divided by the number of pedestrians.
+
+    Cells that are already predicted well (most of the background) count
+    little, because of the factors p**2 and (1 - p)**2; cells near a centre
+    (score target close to 1) count less as negatives, because of the factor
+    (1 - target)**4.
+    """
+    responsible = score_targets == 1
+    p = score_logits.sigmoid().clamp(1e-4, 1 - 1e-4)
+    n = responsible.sum().clamp(min=1)
+    positive_loss = -((1 - p) ** 2 * torch.log(p))[responsible].sum()
+    negative_loss = -((1 - score_targets) ** 4 * p ** 2 * torch.log(1 - p))[~responsible].sum()
+    return (positive_loss + negative_loss) / n
+
+
+def activate(output):
+    """Raw network output [B, 5, H, W] -> predicted maps in the layout of the targets.
+
+    A sigmoid turns the score into a probability and keeps the centre offsets
+    between 0 and 1; the log sizes are used as they are.
+    """
+    score = output[:, 0:1].sigmoid()
+    offset = output[:, 1:3].sigmoid()
+    size = output[:, 3:5]
+    return torch.cat([score, offset, size], dim=1)
+
+
+def box_loss(output, targets):
+    """L1 loss of the 4 box channels, only in the responsible cells (score target 1)."""
+    responsible = targets[:, 0] == 1                                      # [B, H, W]
+    predicted = activate(output)[:, 1:].permute(0, 2, 3, 1)[responsible]  # [n, 4]
+    wanted = targets[:, 1:].permute(0, 2, 3, 1)[responsible]
+    return F.l1_loss(predicted, wanted) if responsible.any() else output.sum() * 0
+
+
+def maps_to_boxes(maps, stride, score_threshold=0.05, nms_iou=0.5, max_detections=100):
+    """Maps [B, 5, H, W] (predicted or target) -> a list of {"boxes": [N, 4], "scores": [N]}.
+
+    Every cell with a score above ``score_threshold`` gives one box.
+    Non-maximum suppression (NMS) then keeps only the highest-scoring box among
+    boxes that overlap by more than ``nms_iou`` (``nms_iou=None``: no NMS).
+    """
+    from torchvision.ops import nms
+    B, _, H, W = maps.shape
+    rows, cols = torch.meshgrid(torch.arange(H, device=maps.device),
+                                torch.arange(W, device=maps.device), indexing="ij")
+    detections = []
+    for m in maps:                                          # one image at a time
+        cx = (cols + m[1]) * stride                         # centre in pixels
+        cy = (rows + m[2]) * stride
+        w, h = m[3].exp() * stride, m[4].exp() * stride    # size in pixels
+        boxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1).reshape(-1, 4)
+        scores = m[0].reshape(-1)
+
+        keep = scores > score_threshold
+        boxes, scores = boxes[keep], scores[keep]
+        if nms_iou is not None:
+            keep = nms(boxes, scores, nms_iou)
+            boxes, scores = boxes[keep], scores[keep]
+        best = scores.argsort(descending=True)[:max_detections]
+        detections.append({"boxes": boxes[best], "scores": scores[best]})
+    return detections
+
+
+def keep_peaks(maps, window=3):
+    """Set the score to 0 in every cell that is not a local maximum of the score map.
+
+    A cell is kept when no cell in the ``window`` x ``window`` neighbourhood
+    around it has a higher score, so each peak of the score map gives one box.
+    """
+    score = maps[:, 0:1]
+    peaks = score * (F.max_pool2d(score, kernel_size=window, stride=1, padding=window // 2) == score)
+    return torch.cat([peaks, maps[:, 1:]], dim=1)
+
+
+TARGET_ENCODINGS = {"centre_cell": encode_centre_cell, "gaussian": encode_gaussian}
+SCORE_LOSSES = {"bce": bce_score_loss, "focal": focal_score_loss}
+DECODINGS = ("nms", "peaks")
+
+
+class DetectorFeatures(nn.Module):
+    """Backbone and neck: images -> feature maps with ``stride`` pixels per grid cell.
+
+    neck (only used for a stride below 32):
+        "upsample"  layer4 features (deep, stride 32) upsampled by transposed
+                    convolutions, as in CenterNet.
+        "fpn"       layer4 features upsampled step by step and added to the
+                    features of the earlier stages at the same stride (a
+                    top-down feature pyramid, as in RetinaNet and FCOS).
+        "cut"       the backbone is cut after an earlier stage; no neck. The
+                    features are finer but less deep.
+    """
+
+    def __init__(self, arch="resnet18", stride=32, neck="upsample", channels=256):
+        super().__init__()
+        self.neck_type = neck if stride != 32 else "none"
+        stop_at = _STAGE_FOR_STRIDE[stride] if neck == "cut" else "layer4"
+        self.backbone, backbone_channels, _ = build_backbone(arch, stop_at)
+        self.out_channels = backbone_channels
+        steps = int(math.log2(32 // stride))                 # number of 2x upsampling steps
+
+        if self.neck_type == "upsample":
+            layers, c = [], backbone_channels
+            for _ in range(steps):
+                layers += [nn.ConvTranspose2d(c, channels, kernel_size=4, stride=2, padding=1, bias=False),
+                           nn.BatchNorm2d(channels), nn.ReLU()]
+                c = channels
+            self.neck = nn.Sequential(*layers)
+            self.out_channels = channels
+        elif self.neck_type == "fpn":
+            stage_channels = [self._stage_channels(arch, s) for s in ("layer3", "layer2", "layer1")[:steps]]
+            self.top = nn.Conv2d(backbone_channels, channels, kernel_size=1)
+            self.laterals = nn.ModuleList(nn.Conv2d(c, channels, kernel_size=1) for c in stage_channels)
+            self.smooth = nn.Sequential(nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+                                        nn.BatchNorm2d(channels), nn.ReLU())
+            self.out_channels = channels
+
+    @staticmethod
+    def _stage_channels(arch, stage):
+        expansion = 4 if arch == "resnet50" else 1
+        return {"layer1": 64, "layer2": 128, "layer3": 256}[stage] * expansion
+
+    def forward(self, images):
+        x, stages = images, []
+        for layer in self.backbone:
+            x = layer(x)
+            stages.append(x)
+        if self.neck_type == "upsample":
+            return self.neck(x)
+        if self.neck_type == "fpn":
+            # backbone children: conv1, bn1, relu, maxpool, layer1 (4), layer2 (5), layer3 (6), layer4 (7)
+            finer = [stages[6], stages[5], stages[4]]
+            top = self.top(x)
+            for lateral, feature in zip(self.laterals, finer):
+                top = F.interpolate(top, scale_factor=2, mode="nearest") + lateral(feature)
+            return self.smooth(top)
+        return x
+
+
+class SingleStageDetector(nn.Module):
+    """A single-stage detector made of the chosen design options (see ``build_detector``).
+
+    The model is used like any network (``output = model(images)``) and also
+    holds the matching design parts:
+
+        model.encode_targets(boxes, grid_size)   true boxes -> target maps
+        model.loss(output, targets)              dict of loss terms {"score", "box"}
+        model.activate(output)                   raw output -> predicted maps
+        model.maps_to_boxes(maps)                predicted (or target) maps -> boxes
+        model.decode(output)                     raw output -> boxes (used by the evaluation)
+    """
+
+    def __init__(self, backbone="resnet18", stride=32, neck="upsample", targets="centre_cell",
+                 score_loss="bce", decoding="nms", head_channels=256):
+        super().__init__()
+        for name, value, allowed in (("stride", stride, STRIDES), ("neck", neck, NECKS),
+                                     ("targets", targets, tuple(TARGET_ENCODINGS)),
+                                     ("score_loss", score_loss, tuple(SCORE_LOSSES)),
+                                     ("decoding", decoding, DECODINGS)):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, not {value!r}")
+        self.design = dict(backbone=backbone, stride=stride, neck=neck if stride != 32 else None,
+                           targets=targets, score_loss=score_loss, decoding=decoding)
+        self.stride = stride
+        self.features = DetectorFeatures(backbone, stride, neck)
+        self.head = nn.Sequential(
+            nn.Conv2d(self.features.out_channels, head_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(head_channels, 5, kernel_size=1),          # 5 numbers per grid cell
+        )
+        if score_loss == "focal":
+            # Start with a score probability of 0.1 everywhere: with the focal loss, the
+            # default start (0.5) gives a large loss on every background cell at first.
+            nn.init.constant_(self.head[-1].bias[0], -2.19)
+
+    def forward(self, images):
+        return self.head(self.features(images))
+
+    def describe(self):
+        """The design as one line of text, e.g. for the settings of a run."""
+        d = self.design
+        neck = f" ({d['neck']})" if d["neck"] else ""
+        return (f"{d['backbone']}, stride {d['stride']}{neck}, {d['targets']} targets, "
+                f"{d['score_loss']} score loss, {d['decoding']} decoding")
+
+    def encode_targets(self, boxes, grid_size):
+        return TARGET_ENCODINGS[self.design["targets"]](boxes, grid_size, self.stride)
+
+    def loss(self, output, targets):
+        return {"score": SCORE_LOSSES[self.design["score_loss"]](output[:, 0], targets[:, 0]),
+                "box": box_loss(output, targets)}
+
+    @staticmethod
+    def activate(output):
+        return activate(output)
+
+    def maps_to_boxes(self, maps, score_threshold=0.05, nms_iou=0.5, max_detections=100,
+                      remove_duplicates=True):
+        """Maps -> boxes. Duplicates are removed by NMS or by keeping peaks, as in the design;
+        ``remove_duplicates=False`` keeps one box for every cell above the threshold."""
+        if not remove_duplicates:
+            nms_iou = None
+        elif self.design["decoding"] == "peaks":
+            maps, nms_iou = keep_peaks(maps), None
+        return maps_to_boxes(maps, self.stride, score_threshold, nms_iou, max_detections)
+
+    def decode(self, output, **options):
+        return self.maps_to_boxes(activate(output), **options)
+
+
+def build_detector(backbone="resnet18", stride=32, neck="upsample", targets="centre_cell",
+                   score_loss="bce", decoding="nms"):
+    """A new single-stage detector (ImageNet-trained backbone) with the given design.
+
+        backbone    "resnet18", "resnet34" or "resnet50"
+        stride      pixels per grid cell: 32, 16, 8 or 4
+        neck        how a stride below 32 is obtained: "upsample", "fpn" or "cut"
+                    (see ``DetectorFeatures``)
+        targets     score target: "centre_cell" (``encode_centre_cell``) or
+                    "gaussian" (``encode_gaussian``)
+        score_loss  "bce" (``bce_score_loss``) or "focal" (``focal_score_loss``);
+                    the box loss is always ``box_loss``
+        decoding    duplicate removal: "nms" (``maps_to_boxes``) or "peaks" (``keep_peaks``)
+
+    The defaults are the YOLO-style starting point.
+    """
+    return SingleStageDetector(backbone, stride, neck, targets, score_loss, decoding)
 
 
 # ---------------------------------------------------------------------------

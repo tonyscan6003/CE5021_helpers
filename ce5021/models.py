@@ -162,9 +162,13 @@ def count_parameters(model):
     return total, trainable
 
 
-def _layer_flops(module, output):
+def _layer_flops(module, inputs, output):
     """Forward FLOPs for one image through a convolution or linear layer (2 per multiply-add)."""
     per_image = output.numel() // output.shape[0]
+    if isinstance(module, nn.ConvTranspose2d):           # every input value is spread over k x k outputs
+        k_h, k_w = module.kernel_size
+        in_per_image = inputs[0].numel() // inputs[0].shape[0]
+        return 2 * in_per_image * (module.out_channels // module.groups) * k_h * k_w
     if isinstance(module, nn.Conv2d):
         k_h, k_w = module.kernel_size
         return 2 * per_image * (module.in_channels // module.groups) * k_h * k_w
@@ -184,32 +188,35 @@ def compute_cost(model, image_size, device="cpu", verbose=True):
                           only run forward, so freezing makes training cheaper.
         image_size
 
-    FLOPs are counted for the convolution and linear layers, which account for
-    nearly all of the computation. Multiply ``train_flops`` by the number of
-    training images and epochs to get the compute used for a training run.
+    ``image_size`` is one number for square images or ``(height, width)``.
+    FLOPs are counted for the convolution (also transposed) and linear layers,
+    which account for nearly all of the computation. Multiply ``train_flops``
+    by the number of training images and epochs to get the compute used for a
+    training run.
     """
     import torch
 
+    height, width = (image_size, image_size) if isinstance(image_size, int) else image_size
     info = getattr(model, "ce5021_info", {})
-    if image_size < info.get("min_size", 0):
+    if min(height, width) < info.get("min_size", 0):
         raise ValueError(f"{info['arch']} needs images of at least {info['min_size']}x"
                          f"{info['min_size']} pixels; image_size is {image_size}")
 
     totals = {"all": 0, "trained": 0}
 
     def hook(module, inputs, output):
-        flops = _layer_flops(module, output)
+        flops = _layer_flops(module, inputs, output)
         totals["all"] += flops
         if any(p.requires_grad for p in module.parameters()):
             totals["trained"] += flops
 
     handles = [m.register_forward_hook(hook) for m in model.modules()
-               if isinstance(m, (nn.Conv2d, nn.Linear))]
+               if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear))]
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad():
-            model(torch.randn(1, 3, image_size, image_size, device=device))
+            model(torch.randn(1, 3, height, width, device=device))
     finally:
         for h in handles:
             h.remove()
@@ -223,7 +230,7 @@ def compute_cost(model, image_size, device="cpu", verbose=True):
             "train_flops": train, "image_size": image_size, **info}
     if verbose:
         name = f"{info['arch']} (strategy {strategy_text(info)}, head {info['head']})" if info else "model"
-        print(f"{name}, {image_size}x{image_size} images")
+        print(f"{name}, {height}x{width} images")
         print(f"  parameters : {format_count(total)} total, {format_count(trainable)} trained")
         print(f"  inference  : {inference / 1e9:.3f} GFLOP per image")
         print(f"  training   : {train / 1e9:.3f} GFLOP per training image (forward + backward)")
