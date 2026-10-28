@@ -49,17 +49,108 @@ def denormalize(image, mean=IMAGENET_MEAN, std=IMAGENET_STD):
     return np.clip(image.numpy(), 0, 1)
 
 
+# The same images as the original CIFAR-10 files, hosted by Hugging Face, whose
+# servers are much faster than the original site. The test set is in the
+# original order; the training set is in a different order (it is shuffled
+# for training anyway).
+CIFAR10_HF_URL = ("https://huggingface.co/datasets/uoft-cs/cifar10/resolve/main/"
+                  "plain_text/{split}-00000-of-00001.parquet")
+CIFAR10_HF_SIZES = {"train": 50_000, "test": 10_000}
+
+
+class CIFAR10Images(torch.utils.data.Dataset):
+    """CIFAR-10 images held in memory; each item is (PIL image, class index).
+
+    Behaves like ``torchvision.datasets.CIFAR10``: the same transforms work,
+    and ``data`` (uint8 array [N, 32, 32, 3]), ``targets`` and ``classes``
+    hold the same information.
+    """
+
+    def __init__(self, data, targets, transform=None):
+        self.data, self.targets, self.transform = data, list(targets), transform
+        self.classes = CIFAR10_CLASSES
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, index):
+        from PIL import Image
+        image = Image.fromarray(self.data[index])
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, self.targets[index]
+
+
+def _download(url, path):
+    """Download ``url`` to ``path`` (via a temporary file, so an interrupted
+    download never leaves a partial file behind)."""
+    import urllib.request
+    partial = path + ".part"
+    urllib.request.urlretrieve(url, partial)
+    os.replace(partial, path)
+
+
+def _cifar10_from_huggingface(root):
+    """Return {"train": (data, targets), "test": (data, targets)} from the Hugging Face copy."""
+    import io
+
+    import pyarrow.parquet as pq   # preinstalled in Colab
+    from PIL import Image
+
+    folder = os.path.join(root, "cifar10_hf")
+    os.makedirs(folder, exist_ok=True)
+    splits = {}
+    for split, size in CIFAR10_HF_SIZES.items():
+        path = os.path.join(folder, f"{split}.parquet")
+        if not os.path.exists(path):
+            _download(CIFAR10_HF_URL.format(split=split), path)
+        try:
+            table = pq.read_table(path)
+            images = table.column("img").to_pylist()
+            targets = [int(t) for t in table.column("label").to_pylist()]
+            data = np.stack([np.asarray(Image.open(io.BytesIO(im["bytes"])).convert("RGB"))
+                             for im in images])
+            if len(targets) != size or data.shape[1:] != (32, 32, 3) or not 0 <= min(targets) <= max(targets) <= 9:
+                raise ValueError(f"unexpected contents in {path}")
+        except Exception:
+            os.remove(path)                # damaged file: download it again next time
+            raise
+        splits[split] = (data, targets)
+    return splits
+
+
+def cifar10_datasets(train_transform, test_transform, root="data"):
+    """Return the CIFAR-10 (train, test) datasets, downloading them the first time.
+
+    Sources, in order: torchvision's CIFAR-10 files already in ``root``; the
+    Hugging Face copy (fast); the original CIFAR-10 site (slow) if Hugging
+    Face cannot be reached.
+    """
+    try:                                   # already downloaded by torchvision
+        return (datasets.CIFAR10(root=root, train=True, download=False, transform=train_transform),
+                datasets.CIFAR10(root=root, train=False, download=False, transform=test_transform))
+    except RuntimeError:
+        pass
+    try:
+        splits = _cifar10_from_huggingface(root)
+        print("CIFAR-10 loaded (from the Hugging Face copy of the dataset)")
+        return (CIFAR10Images(*splits["train"], transform=train_transform),
+                CIFAR10Images(*splits["test"], transform=test_transform))
+    except Exception as exc:
+        print(f"The fast CIFAR-10 download failed ({type(exc).__name__}: {exc}); "
+              "downloading from the original CIFAR-10 site instead, which can be slow.")
+    return (datasets.CIFAR10(root=root, train=True, download=True, transform=train_transform),
+            datasets.CIFAR10(root=root, train=False, download=True, transform=test_transform))
+
+
 def cifar10_loaders(train_transform, test_transform, batch_size=128, root="data",
                     num_workers=2):
     """Download CIFAR-10 (first time only) and return (train_loader, test_loader).
 
     The training loader shuffles the images every epoch; the test loader
-    keeps a fixed order.
+    keeps a fixed order. See ``cifar10_datasets`` for where the images come from.
     """
-    train_data = datasets.CIFAR10(root=root, train=True, download=True,
-                                  transform=train_transform)
-    test_data = datasets.CIFAR10(root=root, train=False, download=True,
-                                 transform=test_transform)
+    train_data, test_data = cifar10_datasets(train_transform, test_transform, root)
 
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers)

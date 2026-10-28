@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ce5021"
-version = "2026.1"
+version = "2026.2"
 description = "Helper functions for the CE5021 deep learning assignments"
 readme = "README.md"
 requires-python = ">=3.9"
