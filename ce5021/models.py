@@ -63,6 +63,18 @@ def make_head(in_features, n_classes, head="linear", hidden=256, dropout=0.5):
     raise ValueError(f"head must be one of {HEADS}, not {head!r}")
 
 
+def _keep_frozen_batchnorm_fixed(model, inputs):
+    """Forward pre-hook: batch normalisation layers without trained parameters stay in eval mode.
+
+    ``model.train()`` would otherwise let them update their running statistics
+    and normalise with batch statistics, so frozen layers would still change.
+    """
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm) and not any(
+                p.requires_grad for p in module.parameters()):
+            module.eval()
+
+
 def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dropout=0.5,
                 train_from=None):
     """Load a torchvision classifier, replace its last layer and choose what is trained.
@@ -78,7 +90,9 @@ def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dro
             the last stage of the network. ``show_layers(model)`` lists the names.
 
     The ImageNet weights are downloaded the first time (not for "scratch").
-    Parameters that are not trained have ``requires_grad = False``.
+    Parameters that are not trained have ``requires_grad = False``, and the
+    batch normalisation layers among them keep their ImageNet statistics, so
+    frozen layers do not change during training.
     """
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch must be one of {list(ARCHITECTURES)}, not {arch!r}")
@@ -106,6 +120,7 @@ def build_model(arch, n_classes, strategy="head", head="linear", hidden=256, dro
             trainable = True
         param.requires_grad = trainable or name.startswith(spec["head"] + ".")
 
+    model.register_forward_pre_hook(_keep_frozen_batchnorm_fixed)
     model.ce5021_info = {"arch": arch, "strategy": strategy, "head": head,
                          "train_from": start, "min_size": spec["min_size"]}
     return model

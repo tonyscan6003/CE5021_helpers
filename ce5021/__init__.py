@@ -11,4 +11,4 @@ Use ``help(function)`` or ``function??`` in a notebook to read the documentation
 and source of any helper.
 """
 
-__version__ = "2026.3"
+__version__ = "2026.4"

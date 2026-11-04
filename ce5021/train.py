@@ -238,16 +238,23 @@ def challenge_score(balanced_acc, compute_tflop, reference_tflop=50, exponent=-0
     return balanced_acc * (compute_tflop / reference_tflop) ** exponent
 
 
+def _size_text(size):
+    """(64, 64) -> 64; (64, 48) -> "64 x 48"."""
+    return size[0] if size[0] == size[1] else f"{size[0]} x {size[1]}"
+
+
 @torch.no_grad()
 def final_evaluation(model, history, train_loader, test_loader, device):
     """Evaluate the trained model once on the test set and print the result block.
 
     The training compute is recalculated here from the model itself (which
-    layers were trained), the image size of the test images, the number of
-    training images per epoch and the number of epochs in ``history``:
+    layers were trained), the size of the training images as they are loaded
+    (after the transforms), the number of training images per epoch and the
+    number of epochs in ``history``:
 
         training compute = training FLOPs per image x images per epoch x epochs
 
+    A warning is printed if the training and test images differ in size.
     The block includes the challenge score S (see ``challenge_score``).
     Returns a dict with all values shown in the block.
     """
@@ -269,12 +276,14 @@ def final_evaluation(model, history, train_loader, test_loader, device):
     else:
         auc = roc_auc_score(y_true, probs, multi_class="ovr")
 
-    image_size = next(iter(test_loader))[0].shape[-1]
-    cost = compute_cost(model, image_size, device, verbose=False)
+    test_size = tuple(next(iter(test_loader))[0].shape[-2:])
+    train_size = tuple(next(iter(train_loader))[0].shape[-2:])
+    cost = compute_cost(model, test_size, device, verbose=False)
+    train_cost = compute_cost(model, train_size, device, verbose=False)
     images_per_epoch = len(train_loader.sampler)
     epochs = len(history.epoch)
     best = history.best_index() if epochs else None
-    compute = cost["train_flops"] * images_per_epoch * epochs
+    compute = train_cost["train_flops"] * images_per_epoch * epochs
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else str(device)
     balanced_acc = 100 * balanced_accuracy_score(y_true, y_pred)
 
@@ -283,7 +292,8 @@ def final_evaluation(model, history, train_loader, test_loader, device):
         "model": cost.get("arch", type(model).__name__),
         "strategy": strategy_text(cost),
         "head": cost.get("head"),
-        "image size": image_size,
+        "image size": _size_text(test_size),
+        **({"training image size": _size_text(train_size)} if train_size != test_size else {}),
         "training images per epoch": images_per_epoch,
         "epochs trained": epochs,
         "weights from epoch": history.epoch[best] + 1 if epochs else None,
@@ -294,7 +304,7 @@ def final_evaluation(model, history, train_loader, test_loader, device):
         "parameters": format_count(cost["params"]),
         "trained parameters": format_count(cost["trainable_params"]),
         "inference GFLOP per image": round(cost["inference_flops"] / 1e9, 3),
-        "training GFLOP per image": round(cost["train_flops"] / 1e9, 3),
+        "training GFLOP per image": round(train_cost["train_flops"] / 1e9, 3),
         "TRAINING COMPUTE (TFLOP)": round(compute / 1e12, 2),
         "SCORE S": round(challenge_score(balanced_acc, compute / 1e12), 1) if compute else None,
         "settings": history.config,
@@ -307,4 +317,8 @@ def final_evaluation(model, history, train_loader, test_loader, device):
     for key, value in result.items():
         print(f"{key:<{width}} : {value}")
     print(line)
+    if train_size != test_size:
+        print(f"WARNING: the training images ({_size_text(train_size)}) and test images "
+              f"({_size_text(test_size)}) differ in size.\nThe training compute is calculated "
+              "from the size of the training images. Check the size given to the transforms.")
     return result
