@@ -1,17 +1,23 @@
-"""Semantic segmentation: the ATR human parsing dataset, pre-trained encoder stages,
-evaluation (IoU) and plots.
+"""Semantic segmentation: the Oxford-IIIT Pet dataset (background, cat, dog), pre-trained
+encoder stages, evaluation (IoU), the challenge score and plots.
 
 The network and the training loop are written in the notebook::
 
-    train_loader, val_loader, test_loader = atr_loaders(image_size, train_tf, test_tf)
-    logits = model(images)                    # [B, n_classes, H, W], same H, W as the images
+    train_loader, val_loader, test_loader = pet_loaders(image_size, train_tf, test_tf)
+    logits = model(images)                    # [B, 3, H, W], same H, W as the images
     loss = loss_fn(logits, masks)             # masks: [B, H, W] class index of every pixel
 
     metrics = evaluate_segmentation(model, val_loader, loss_fn, device)   # loss, mIoU, pixel acc
     preds, masks = predict_segmentation(model, val_loader, device)
     show_segmentation(val_loader.dataset, preds, indices=worst_images(preds, masks))
 
-``image_size`` is ``(height, width)``; both must be multiples of 32.
+The pixels on the outline of each animal are marked ``IGNORE_INDEX`` (255): they
+are left out of the loss (``nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)``)
+and of every metric.
+
+Validation and test results are always measured at ``EVAL_SIZE`` (256 x 256):
+the network sees images of the chosen ``image_size``, and its class scores are
+upsampled to 256 x 256 before they are compared with the masks.
 """
 
 import datetime
@@ -22,89 +28,100 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from .data import IMAGENET_MEAN, IMAGENET_STD, _download, denormalize
+from .data import _download, denormalize
 
-# The ATR dataset (Liang et al., "Deep Human Parsing with Active Template Regression", 2015):
-# 17,706 photographs of one person each, every pixel labelled with one of 18 classes.
-ATR_URL = ("https://huggingface.co/datasets/mattmdjaga/human_parsing_dataset/resolve/main/"
-           "data/train-0000{i}-of-00002-{suffix}.parquet")
-ATR_FILES = ("f3a663f7140ee7fd", "74610e243c32d5d6")
-ATR_SIZE = 17_706
-ATR_SPLIT = (14_706, 1_000, 2_000)      # training, validation, test images
-ATR_CLASSES = ["background", "hat", "hair", "sunglasses", "upper-clothes", "skirt", "pants",
-               "dress", "belt", "left-shoe", "right-shoe", "face", "left-leg", "right-leg",
-               "left-arm", "right-arm", "bag", "scarf"]
+# The Oxford-IIIT Pet dataset (Parkhi et al., "Cats and Dogs", CVPR 2012): 7,349
+# photographs of 37 breeds of cats and dogs, each with a mask ("trimap") of the
+# animal, its outline and the background. The breeds are grouped into cat and dog.
+PET_URL = ("https://huggingface.co/datasets/dpdl-benchmark/oxford_iiit_pet/resolve/main/data/"
+           "{split}-0000{i}-of-00003.parquet")
+PET_FILES = [("train", i) for i in range(3)] + [("test", i) for i in range(3)]
+PET_TRAINVAL, PET_TEST = 3_680, 3_669      # the official split of the dataset
+PET_SIZE = PET_TRAINVAL + PET_TEST
+PET_VAL = 736                              # validation images, taken from the 3,680 at random
+PET_CLASSES = ["background", "cat", "dog"]
+IGNORE_INDEX = 255                         # outline pixels: not used in the loss or the metrics
+EVAL_SIZE = 256                            # images are stored, and results measured, at 256 x 256
 
-# Class of each class after a horizontal flip: a left shoe becomes a right shoe, etc.
-_FLIP_CLASSES = list(range(len(ATR_CLASSES)))
-for _left, _right in ((9, 10), (12, 13), (14, 15)):
-    _FLIP_CLASSES[_left], _FLIP_CLASSES[_right] = _right, _left
-
-# One colour per class for the plots (background black).
-CLASS_COLOURS = np.array([(0, 0, 0)] + [tuple(int(255 * c) for c in plt.cm.tab20(i)[:3])
-                                        for i in range(len(ATR_CLASSES) - 1)], dtype=np.uint8)
+# Colour of each class in the plots (index = class; IGNORE_INDEX light grey).
+CLASS_COLOURS = np.zeros((256, 3), dtype=np.uint8)
+CLASS_COLOURS[:3] = [(35, 35, 35), (235, 104, 52), (42, 120, 214)]
+CLASS_COLOURS[IGNORE_INDEX] = (205, 205, 205)
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
-def download_atr(root="data"):
-    """Download the ATR parquet files from Hugging Face (first time only, about 800 MB).
+def download_pet(root="data"):
+    """Download the Oxford-IIIT Pet parquet files from Hugging Face (first time only, 2.3 GB).
 
-    Returns the list of downloaded files.
+    Returns the list of downloaded files: the 3,680 training and validation
+    images first, then the 3,669 test images.
     """
-    folder = os.path.join(root, "atr")
+    folder = os.path.join(root, "pet")
     os.makedirs(folder, exist_ok=True)
     paths = []
-    for i, suffix in enumerate(ATR_FILES):
-        path = os.path.join(folder, f"train-{i}.parquet")
+    for n, (split, i) in enumerate(PET_FILES):
+        path = os.path.join(folder, f"{split}-{i}.parquet")
         if not os.path.exists(path):
-            print(f"Downloading ATR part {i + 1} of {len(ATR_FILES)} (about 400 MB) ...")
-            _download(ATR_URL.format(i=i, suffix=suffix), path)
+            print(f"Downloading Oxford-IIIT Pet part {n + 1} of {len(PET_FILES)} (about 380 MB) ...")
+            _download(PET_URL.format(split=split, i=i), path)
         paths.append(path)
     return paths
 
 
-def prepare_atr(image_size, root="data"):
-    """Resize every ATR image and mask to ``image_size`` once and store them as arrays.
+def pet_mask(trimap, species):
+    """Trimap (1 animal, 2 background, 3 outline) -> classes (0 background, 1 cat, 2 dog, 255 outline).
 
-    Returns the paths of ``images`` [N, H, W, 3] and ``masks`` [N, H, W] (uint8
-    ``.npy`` files, read from disk while training rather than held in memory).
-    Images are resized smoothly; masks with the nearest pixel, so every pixel
-    keeps a valid class.
+    ``species`` is 0 for a cat and 1 for a dog.
+    """
+    trimap = np.asarray(trimap)
+    return np.where(trimap == 1, 1 + species,
+                    np.where(trimap == 2, 0, IGNORE_INDEX)).astype(np.uint8)
+
+
+def prepare_pet(root="data"):
+    """Resize every image and mask to 256 x 256 once and store them as arrays.
+
+    Returns the paths of ``images`` [N, 256, 256, 3] and ``masks`` [N, 256, 256]
+    (uint8 ``.npy`` files, read from disk while training rather than held in
+    memory). Images are resized smoothly; masks with the nearest pixel, so every
+    pixel keeps a valid class. The photographs have different shapes, so they
+    are stretched to a square.
     """
     import pyarrow.parquet as pq     # preinstalled in Colab
     from PIL import Image
 
-    height, width = image_size
-    folder = os.path.join(root, "atr")
-    images_path = os.path.join(folder, f"images_{height}x{width}.npy")
-    masks_path = os.path.join(folder, f"masks_{height}x{width}.npy")
+    folder = os.path.join(root, "pet")
+    images_path = os.path.join(folder, f"images_{EVAL_SIZE}.npy")
+    masks_path = os.path.join(folder, f"masks_{EVAL_SIZE}.npy")
     if os.path.exists(images_path) and os.path.exists(masks_path):
         return images_path, masks_path
 
-    parquet_files = download_atr(root)
-    print(f"Resizing the images to {height} x {width} (first time only, about a minute) ...")
+    parquet_files = download_pet(root)
+    print(f"Resizing the images to {EVAL_SIZE} x {EVAL_SIZE} (first time only, about two minutes) ...")
+    size = (EVAL_SIZE, EVAL_SIZE)
     images = np.lib.format.open_memmap(images_path + ".part", mode="w+", dtype=np.uint8,
-                                       shape=(ATR_SIZE, height, width, 3))
+                                       shape=(PET_SIZE, *size, 3))
     masks = np.lib.format.open_memmap(masks_path + ".part", mode="w+", dtype=np.uint8,
-                                      shape=(ATR_SIZE, height, width))
+                                      shape=(PET_SIZE, *size))
     n = 0
     for path in parquet_files:
-        table = pq.read_table(path)
-        for start in range(0, table.num_rows, 1000):
-            for row in table.slice(start, 1000).to_pylist():
+        parquet = pq.ParquetFile(path)
+        for group in range(parquet.num_row_groups):      # one row group at a time: low memory
+            for row in parquet.read_row_group(group).to_pylist():
                 image = Image.open(io.BytesIO(row["image"]["bytes"])).convert("RGB")
-                mask = Image.open(io.BytesIO(row["mask"]["bytes"]))
-                images[n] = np.asarray(image.resize((width, height), Image.BILINEAR))
-                masks[n] = np.asarray(mask.resize((width, height), Image.NEAREST))
+                trimap = Image.open(io.BytesIO(row["segmentation_mask"]["bytes"])).convert("L")
+                images[n] = np.asarray(image.resize(size, Image.BILINEAR))
+                masks[n] = pet_mask(trimap.resize(size, Image.NEAREST), row["species"])
                 n += 1
-    if n != ATR_SIZE or masks.max() >= len(ATR_CLASSES):
-        raise ValueError(f"unexpected contents in {folder}: {n} images")
+    if n != PET_SIZE:
+        raise ValueError(f"unexpected contents in {folder}: {n} images instead of {PET_SIZE}")
     images.flush(), masks.flush()
     del images, masks
     os.replace(images_path + ".part", images_path)
@@ -112,135 +129,152 @@ def prepare_atr(image_size, root="data"):
     return images_path, masks_path
 
 
-class RandomFlipLeftRight(nn.Module):
-    """Flip an image and its mask horizontally with probability ``p``, and swap left and right.
+def _as_size(image_size):
+    """64 -> (64, 64); (h, w) unchanged. Checked: multiples of 32, at most EVAL_SIZE."""
+    size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
+    if len(size) != 2 or any(s % 32 or not 32 <= s <= EVAL_SIZE for s in size):
+        raise ValueError(f"image_size must be a multiple of 32 between 32 and {EVAL_SIZE} "
+                         f"(or a (height, width) pair of them), not {image_size}")
+    return size
 
-    After a flip, a left arm is on the right of the image and looks like a
-    right arm, so its label must change too: ``v2.RandomHorizontalFlip`` would
-    keep the old labels and teach the network contradicting targets.
-    Used inside ``v2.Compose`` with an (image, mask) pair.
+
+class PetSegmentation(Dataset):
+    """Pet images and masks (stored at 256 x 256), selected by ``indices``.
+
+    Each item is ``(image, mask)``. The image is resized to ``image_size`` and
+    then passed through ``transform`` (a torchvision ``v2`` transform applied to
+    the image and the mask together: geometric transforms move the mask with the
+    image; colour transforms only change the image). The mask is a tensor
+    [H, W] of class indices (int64), resized to ``image_size`` too when
+    ``mask_at_image_size`` (training), or kept at 256 x 256 (validation, test).
     """
 
-    def __init__(self, p=0.5):
-        super().__init__()
-        self.p = p
-        self.register_buffer("flip_classes", torch.tensor(_FLIP_CLASSES), persistent=False)
-
-    def forward(self, image, mask):
-        from torchvision import tv_tensors
-        from torchvision.transforms.v2 import functional as TF
-        if torch.rand(1).item() < self.p:
-            image = TF.horizontal_flip(image)
-            mask = tv_tensors.wrap(self.flip_classes[TF.horizontal_flip(mask).long()], like=mask)
-        return image, mask
-
-
-class ATRSegmentation(Dataset):
-    """ATR images and masks (already resized), selected by ``indices``.
-
-    Each item is ``(image, mask)``: the image after ``transform`` (a
-    torchvision ``v2`` transform applied to the image and the mask together)
-    and the mask as a tensor [H, W] of class indices (int64). Geometric
-    transforms move the mask with the image; colour transforms only change
-    the image.
-    """
-
-    def __init__(self, images_path, masks_path, indices, transform=None):
+    def __init__(self, images_path, masks_path, indices, image_size=EVAL_SIZE, transform=None,
+                 mask_at_image_size=True):
         self.images_path, self.masks_path = images_path, masks_path
         self.indices, self.transform = np.asarray(indices), transform
+        self.image_size, self.mask_at_image_size = _as_size(image_size), mask_at_image_size
         self._images = self._masks = None
-        self.classes = ATR_CLASSES
+        self.classes = PET_CLASSES
 
     def __len__(self):
         return len(self.indices)
 
     def class_pixel_counts(self):
-        """Number of pixels of each class over all (untransformed) masks of this dataset."""
+        """Pixels of each class (and of the ignored outline) over all masks of this dataset, at 256 x 256.
+
+        Returns ``(counts, outline, images_with_class)``.
+        """
         masks = np.load(self.masks_path, mmap_mode="r")
-        counts = np.zeros(len(ATR_CLASSES), dtype=np.int64)
-        for start in range(0, len(self.indices), 1000):           # in chunks, to keep memory low
-            chunk = masks[np.sort(self.indices[start:start + 1000])]
-            counts += np.bincount(chunk.reshape(-1), minlength=len(ATR_CLASSES))
-        return counts
+        counts = np.zeros(256, dtype=np.int64)
+        images_with = np.zeros(len(PET_CLASSES), dtype=np.int64)
+        for start in range(0, len(self.indices), 500):            # in chunks, to keep memory low
+            chunk = masks[np.sort(self.indices[start:start + 500])]
+            counts += np.bincount(chunk.reshape(-1), minlength=256)
+            for c in range(len(PET_CLASSES)):
+                images_with[c] += int((chunk == c).any(axis=(1, 2)).sum())
+        return counts[:len(PET_CLASSES)], int(counts[IGNORE_INDEX]), images_with
 
     def __getitem__(self, index):
         from torchvision import tv_tensors
+        from torchvision.transforms.v2 import functional as TF
         if self._images is None:          # opened here, so each data-loading worker opens its own
             self._images = np.load(self.images_path, mmap_mode="r")
             self._masks = np.load(self.masks_path, mmap_mode="r")
         i = self.indices[index]
         image = tv_tensors.Image(torch.from_numpy(np.array(self._images[i])).permute(2, 0, 1))
         mask = tv_tensors.Mask(torch.from_numpy(np.array(self._masks[i])))
+        if self.image_size != (EVAL_SIZE, EVAL_SIZE):
+            image = TF.resize(image, list(self.image_size), antialias=True)
+            if self.mask_at_image_size:
+                mask = TF.resize(mask, list(self.image_size))      # nearest pixel for a mask
         if self.transform is not None:
             image, mask = self.transform(image, mask)
         return image, torch.as_tensor(mask).long()
 
 
-def atr_loaders(image_size, train_transform, test_transform, batch_size=16, n_train=None,
-                root="data", split=ATR_SPLIT, seed=0, num_workers=2):
-    """Download ATR and return (train_loader, val_loader, test_loader).
+def pet_loaders(image_size, train_transform, test_transform, batch_size=32, n_train=None,
+                root="data", seed=0, num_workers=2):
+    """Download the Oxford-IIIT Pet dataset and return (train_loader, val_loader, test_loader).
 
     Args:
-        image_size: (height, width) of the images, both multiples of 32. The
-            photographs are about 600 x 400 pixels (portrait); (288, 192) and
-            (384, 256) keep their shape.
-        n_train: number of training images to use (None: all ``split[0]``),
-            for shorter experiments. The validation and test sets are always
-            complete.
+        image_size: size of the images given to the network: a multiple of 32
+            up to 256, or a (height, width) pair of them.
+        n_train: number of training images to use (None: all 2,944), for
+            shorter experiments. The validation and test sets are always complete.
 
-    The 17,706 images are split at random (fixed by ``seed``) into ``split``
-    training, validation and test images. A batch is ``(images, masks)``:
-    images [B, 3, H, W] and masks [B, H, W] holding the class index of every
-    pixel.
+    The 3,680 images of the official training split are divided at random
+    (fixed by ``seed``) into 2,944 training and 736 validation images; the
+    3,669 images of the official test split are the test set. A batch is
+    ``(images, masks)``: images [B, 3, H, W] and masks [B, H, W] holding the
+    class of every pixel (0 background, 1 cat, 2 dog, 255 outline). Training
+    masks have the size of the images; validation and test masks are always
+    256 x 256, so that every design is measured at the same resolution.
     """
-    height, width = image_size
-    if height % 32 or width % 32:
-        raise ValueError(f"image_size must be (height, width), both multiples of 32, not {image_size}")
-    images_path, masks_path = prepare_atr(image_size, root)
-    order = np.random.default_rng(seed).permutation(ATR_SIZE)
-    n_tr, n_val, n_test = split
-    parts = [order[:n_tr][:n_train], order[n_tr:n_tr + n_val], order[n_tr + n_val:n_tr + n_val + n_test]]
-    datasets = [ATRSegmentation(images_path, masks_path, idx, tf)
-                for idx, tf in zip(parts, (train_transform, test_transform, test_transform))]
+    image_size = _as_size(image_size)
+    images_path, masks_path = prepare_pet(root)
+    order = np.random.default_rng(seed).permutation(PET_TRAINVAL)
+    parts = [order[PET_VAL:][:n_train], np.sort(order[:PET_VAL]), np.arange(PET_TRAINVAL, PET_SIZE)]
+    datasets = [PetSegmentation(images_path, masks_path, idx, image_size, tf, mask_at_image_size=train)
+                for idx, tf, train in zip(parts, (train_transform, test_transform, test_transform),
+                                          (True, False, False))]
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     return (DataLoader(datasets[0], shuffle=True, drop_last=True, **kwargs),
             DataLoader(datasets[1], **kwargs), DataLoader(datasets[2], **kwargs))
 
 
 # ---------------------------------------------------------------------------
-# Pre-trained encoder
+# Pre-trained encoders
 # ---------------------------------------------------------------------------
 
-ENCODERS = ("resnet18", "resnet34", "resnet50")
+# For each network: the slices of its layers that form the 5 stages (1/2 ... 1/32 of the input).
+_ENCODER_STAGES = {
+    "resnet18": None, "resnet34": None, "resnet50": None,
+    "mobilenet_v3_large": ((0, 2), (2, 4), (4, 7), (7, 13), (13, 16)),
+    "efficientnet_b0": ((0, 2), (2, 3), (3, 4), (4, 6), (6, 8)),
+}
+ENCODERS = tuple(_ENCODER_STAGES)
 
 
-def resnet_stages(arch="resnet18", pretrained=True):
-    """The stages of an ImageNet-trained ResNet, as separate modules, for an encoder.
+def encoder_stages(arch="resnet18", pretrained=True):
+    """The stages of an ImageNet-trained classification network, as separate modules, for an encoder.
 
-    Returns ``(stages, channels)``: ``stages`` is an ``nn.ModuleList`` of 5
-    modules applied one after the other; the output of stage k has
-    ``channels[k]`` channels and 1/2, 1/4, 1/8, 1/16, 1/32 of the input size::
+    ``arch`` is one of ``ENCODERS``. Returns ``(stages, channels)``: ``stages``
+    is an ``nn.ModuleList`` of 5 modules applied one after the other; the
+    output of stage k has ``channels[k]`` channels and 1/2, 1/4, 1/8, 1/16,
+    1/32 of the input height and width::
 
         features = []
         for stage in stages:
             x = stage(x)
             features.append(x)     # kept for the skip connections of a decoder
 
-    The classifier (average pooling and fully connected layer) is not included.
+    The classifier (average pooling and fully connected layers) is not included.
+    The stages are trained with the rest of the network unless their parameters
+    are frozen (``requires_grad = False``).
     """
     from torchvision import models as tv_models
     if arch not in ENCODERS:
         raise ValueError(f"arch must be one of {ENCODERS}, not {arch!r}")
     net = getattr(tv_models, arch)(weights="DEFAULT" if pretrained else None)
-    stages = nn.ModuleList([
-        nn.Sequential(net.conv1, net.bn1, net.relu),     # 1/2
-        nn.Sequential(net.maxpool, net.layer1),          # 1/4
-        net.layer2,                                      # 1/8
-        net.layer3,                                      # 1/16
-        net.layer4,                                      # 1/32
-    ])
-    expansion = 4 if arch == "resnet50" else 1
-    channels = [64, 64 * expansion, 128 * expansion, 256 * expansion, 512 * expansion]
+    if arch.startswith("resnet"):
+        stages = nn.ModuleList([
+            nn.Sequential(net.conv1, net.bn1, net.relu),     # 1/2
+            nn.Sequential(net.maxpool, net.layer1),          # 1/4
+            net.layer2,                                      # 1/8
+            net.layer3,                                      # 1/16
+            net.layer4,                                      # 1/32
+        ])
+    else:
+        stages = nn.ModuleList([net.features[a:b] for a, b in _ENCODER_STAGES[arch]])
+    channels, x = [], torch.zeros(1, 3, 64, 64)
+    was_training = stages.training
+    stages.eval()
+    with torch.no_grad():
+        for stage in stages:
+            x = stage(x)
+            channels.append(x.shape[1])
+    stages.train(was_training)
     return stages, channels
 
 
@@ -248,12 +282,22 @@ def resnet_stages(arch="resnet18", pretrained=True):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def confusion_matrix(preds, masks, n_classes=len(ATR_CLASSES)):
-    """Pixel counts [n_classes, n_classes]: row = true class, column = predicted class."""
-    preds = torch.as_tensor(np.asarray(preds)).reshape(-1).long()
-    masks = torch.as_tensor(np.asarray(masks)).reshape(-1).long()
-    return torch.bincount(masks * n_classes + preds, minlength=n_classes ** 2).reshape(
-        n_classes, n_classes).numpy()
+def confusion_matrix(preds, masks, n_classes=len(PET_CLASSES)):
+    """Pixel counts [n_classes, n_classes]: row = true class, column = predicted class.
+
+    Pixels marked ``IGNORE_INDEX`` in ``masks`` are left out. The pixels are
+    counted in chunks, so that the whole test set fits in memory.
+    """
+    preds = (preds.numpy() if torch.is_tensor(preds) else np.asarray(preds)).reshape(-1)
+    masks = (masks.numpy() if torch.is_tensor(masks) else np.asarray(masks)).reshape(-1)
+    counts = np.zeros(n_classes ** 2, dtype=np.int64)
+    chunk = 1 << 24
+    for start in range(0, len(masks), chunk):
+        m = masks[start:start + chunk].astype(np.int64)
+        p = preds[start:start + chunk].astype(np.int64)
+        keep = m < n_classes
+        counts += np.bincount(m[keep] * n_classes + p[keep], minlength=n_classes ** 2)
+    return counts.reshape(n_classes, n_classes)
 
 
 def metrics_from_confusion(conf):
@@ -261,7 +305,7 @@ def metrics_from_confusion(conf):
 
     The IoU of a class is (pixels correctly given the class) / (pixels that
     are the class or are predicted as the class). The mean IoU (mIoU) is the
-    average over all classes, so a rare class counts as much as the background.
+    average over the classes, so the cats count as much as the background.
     """
     conf = conf.astype(np.float64)
     hits = np.diag(conf)
@@ -269,25 +313,38 @@ def metrics_from_confusion(conf):
     iou = np.where(union > 0, hits / np.maximum(union, 1), np.nan)
     return {"pixel_acc": 100 * hits.sum() / max(conf.sum(), 1),
             "mIoU": 100 * float(np.nanmean(iou)),
-            "class_iou": {name: 100 * float(v) for name, v in zip(ATR_CLASSES, iou)}}
+            "class_iou": {name: 100 * float(v) for name, v in zip(PET_CLASSES, iou)}}
 
 
-def _check_output(logits, masks):
-    if logits.shape[-2:] != masks.shape[-2:]:
+def _check_output(logits, images):
+    if logits.shape[-2:] != images.shape[-2:]:
         raise ValueError(f"the network output {tuple(logits.shape)} must have the same height and "
-                         f"width as the images {tuple(masks.shape[-2:])}")
+                         f"width as the images {tuple(images.shape)}")
+
+
+def _scores_at_mask_size(model, images, masks):
+    """Logits of the model, upsampled (bilinear) to the size of the masks if they differ."""
+    logits = model(images)
+    _check_output(logits, images)
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(logits.float(), size=masks.shape[-2:], mode="bilinear",
+                               align_corners=False)
+    return logits
 
 
 @torch.no_grad()
 def evaluate_segmentation(model, loader, loss_fn, device):
-    """Average loss, pixel accuracy, mIoU and class IoU (in %) of the model on ``loader``."""
+    """Average loss, pixel accuracy, mIoU and class IoU (in %) of the model on ``loader``.
+
+    The class scores are upsampled to the size of the masks (256 x 256 for the
+    validation and test loaders) before the loss and the metrics are computed.
+    """
     model.eval()
     total_loss, seen = 0.0, 0
-    conf = np.zeros((len(ATR_CLASSES), len(ATR_CLASSES)), dtype=np.int64)
+    conf = np.zeros((len(PET_CLASSES), len(PET_CLASSES)), dtype=np.int64)
     for images, masks in loader:
         images, masks = images.to(device), masks.to(device)
-        logits = model(images)
-        _check_output(logits, masks)
+        logits = _scores_at_mask_size(model, images, masks)
         total_loss += loss_fn(logits, masks).item() * len(masks)
         seen += len(masks)
         conf += confusion_matrix(logits.argmax(dim=1).cpu(), masks.cpu())
@@ -296,24 +353,33 @@ def evaluate_segmentation(model, loader, loss_fn, device):
 
 @torch.no_grad()
 def predict_segmentation(model, loader, device):
-    """Return (preds, masks): predicted and true class of every pixel, uint8 arrays [N, H, W]."""
+    """Return (preds, masks): predicted and true class of every pixel, uint8 arrays [N, H, W].
+
+    The predictions have the size of the masks (256 x 256 for the validation
+    and test loaders).
+    """
     model.eval()
     preds, masks = [], []
     for images, true in loader:
-        logits = model(images.to(device))
-        _check_output(logits, true)
+        logits = _scores_at_mask_size(model, images.to(device), true)
         preds.append(logits.argmax(dim=1).cpu().numpy().astype(np.uint8))
         masks.append(true.numpy().astype(np.uint8))
     return np.concatenate(preds), np.concatenate(masks)
 
 
 def image_miou(pred, mask):
-    """Mean IoU (%) of one image, over the classes that appear in its mask or prediction."""
+    """Mean IoU (%) of one image, over the classes that appear in its mask or prediction.
+
+    Outline pixels (``IGNORE_INDEX``) are left out.
+    """
+    pred, mask = np.asarray(pred), np.asarray(mask)
+    keep = mask != IGNORE_INDEX
+    pred, mask = pred[keep], mask[keep]
     ious = []
     for c in np.union1d(np.unique(pred), np.unique(mask)):
         p, m = pred == c, mask == c
         ious.append((p & m).sum() / (p | m).sum())
-    return 100 * float(np.mean(ious))
+    return 100 * float(np.mean(ious)) if ious else float("nan")
 
 
 def worst_images(preds, masks, n=6):
@@ -332,8 +398,10 @@ def colourise(mask):
 
 
 def _legend(fig):
-    handles = [plt.Rectangle((0, 0), 1, 1, color=CLASS_COLOURS[i] / 255) for i in range(len(ATR_CLASSES))]
-    fig.legend(handles, ATR_CLASSES, loc="lower center", ncol=9, fontsize="small", frameon=False)
+    labels = PET_CLASSES + ["outline (ignored)"]
+    colours = [CLASS_COLOURS[i] for i in range(len(PET_CLASSES))] + [CLASS_COLOURS[IGNORE_INDEX]]
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c / 255, edgecolor="gray") for c in colours]
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels), fontsize="small", frameon=False)
 
 
 def show_segmentation(dataset, preds=None, indices=None, n=4, title=""):
@@ -345,7 +413,7 @@ def show_segmentation(dataset, preds=None, indices=None, n=4, title=""):
     """
     indices = list(range(min(n, len(dataset)))) if indices is None else list(indices)[:n]
     rows = 3 if preds is not None else 2
-    fig, axes = plt.subplots(rows, len(indices), figsize=(2.6 * len(indices), 3.6 * rows + 0.6),
+    fig, axes = plt.subplots(rows, len(indices), figsize=(2.6 * len(indices), 2.95 * rows + 0.7),
                              squeeze=False)
     for col, i in enumerate(indices):
         image, mask = dataset[i]
@@ -366,31 +434,34 @@ def show_segmentation(dataset, preds=None, indices=None, n=4, title=""):
 
 
 def plot_class_pixels(dataset):
-    """Bar chart of the share of pixels of each class in ``dataset`` (log scale)."""
-    counts = dataset.class_pixel_counts()
-    share = 100 * counts / counts.sum()
-    fig, ax = plt.subplots(figsize=(11, 3.4))
-    bars = ax.bar(ATR_CLASSES, share, color=CLASS_COLOURS[np.arange(len(ATR_CLASSES))] / 255,
-                  edgecolor="gray")
-    ax.bar_label(bars, labels=[f"{s:.1f}" if s >= 0.1 else f"{s:.2f}" for s in share], fontsize="x-small")
-    ax.set(yscale="log", ylabel="share of pixels (%)",
-           title=f"Pixels of each class ({len(dataset)} images)")
-    ax.tick_params(axis="x", labelrotation=45)
+    """Bar chart of the share of pixels of each class in ``dataset``, with the number of images.
+
+    The outline pixels, which are not used, are shown separately.
+    """
+    counts, outline, images_with = dataset.class_pixel_counts()
+    total = counts.sum() + outline
+    names = PET_CLASSES + ["outline\n(ignored)"]
+    share = 100 * np.append(counts, outline) / total
+    fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    colours = [CLASS_COLOURS[i] / 255 for i in range(len(PET_CLASSES))] + [CLASS_COLOURS[IGNORE_INDEX] / 255]
+    bars = ax.bar(names, share, color=colours, edgecolor="gray")
+    ax.bar_label(bars, labels=[f"{s:.1f}%" for s in share], fontsize="small")
+    ax.set(ylabel="share of pixels (%)", ylim=(0, 100 * 1.12 * share.max() / 100),
+           title=f"{len(dataset)} images: {images_with[1]} with a cat, {images_with[2]} with a dog")
     fig.tight_layout()
     plt.show()
-    return dict(zip(ATR_CLASSES, share))
+    return dict(zip(PET_CLASSES + ["outline"], share))
 
 
 def plot_class_iou(metrics, title="IoU of each class"):
     """Bar chart of the IoU of each class, with the mean IoU as a line."""
     names, values = list(metrics["class_iou"]), list(metrics["class_iou"].values())
-    fig, ax = plt.subplots(figsize=(11, 3.4))
+    fig, ax = plt.subplots(figsize=(6.5, 3.4))
     bars = ax.bar(names, values, color=CLASS_COLOURS[np.arange(len(names))] / 255, edgecolor="gray")
-    ax.bar_label(bars, labels=[f"{v:.0f}" for v in values], fontsize="x-small")
+    ax.bar_label(bars, labels=[f"{v:.1f}" for v in values], fontsize="small")
     ax.axhline(metrics["mIoU"], color="tab:red", linestyle="--", label=f"mIoU {metrics['mIoU']:.1f}%")
     ax.set(ylim=(0, 105), ylabel="IoU (%)", title=title)
-    ax.tick_params(axis="x", labelrotation=45)
-    ax.legend(loc="upper right")
+    ax.legend(loc="lower right")
     fig.tight_layout()
     plt.show()
 
@@ -398,28 +469,28 @@ def plot_class_iou(metrics, title="IoU of each class"):
 def plot_confusion(preds, masks):
     """Confusion matrix of the pixels, each row divided by its total (recall of each class).
 
-    Large values off the diagonal show which classes are mistaken for which.
+    Values off the diagonal show which classes are mistaken for which: cat and
+    dog pixels predicted as background are missed parts of the animal; cat
+    pixels predicted as dog are a wrong recognition of the animal.
     """
     conf = confusion_matrix(preds, masks).astype(np.float64)
     rates = 100 * conf / np.maximum(conf.sum(axis=1, keepdims=True), 1)
-    fig, ax = plt.subplots(figsize=(8.5, 7.5))
+    fig, ax = plt.subplots(figsize=(4.6, 4))
     im = ax.imshow(rates, cmap="Blues", vmin=0, vmax=100)
-    for r in range(len(ATR_CLASSES)):
-        for c in range(len(ATR_CLASSES)):
-            if rates[r, c] >= 1:
-                ax.text(c, r, f"{rates[r, c]:.0f}", ha="center", va="center", fontsize=6,
-                        color="white" if rates[r, c] > 50 else "black")
-    ax.set_xticks(range(len(ATR_CLASSES)), ATR_CLASSES, rotation=90, fontsize="small")
-    ax.set_yticks(range(len(ATR_CLASSES)), ATR_CLASSES, fontsize="small")
-    ax.set(xlabel="predicted class", ylabel="true class",
-           title="Pixels of each true class, by predicted class (%)")
-    fig.colorbar(im, ax=ax, fraction=0.04)
+    for r in range(len(PET_CLASSES)):
+        for c in range(len(PET_CLASSES)):
+            ax.text(c, r, f"{rates[r, c]:.1f}", ha="center", va="center",
+                    color="white" if rates[r, c] > 50 else "black")
+    ax.set_xticks(range(len(PET_CLASSES)), PET_CLASSES)
+    ax.set_yticks(range(len(PET_CLASSES)), PET_CLASSES)
+    ax.set(xlabel="predicted class", ylabel="true class", title="Pixels of each true class (%)")
+    fig.colorbar(im, ax=ax, fraction=0.046)
     fig.tight_layout()
     plt.show()
 
 
 # ---------------------------------------------------------------------------
-# Training history and final result
+# Training history, score and final result
 # ---------------------------------------------------------------------------
 
 class SegmentationHistory:
@@ -512,9 +583,40 @@ class SegmentationHistory:
         return result
 
 
+# The challenge score: S = test mIoU (%) x (training compute / SCORE_REFERENCE_TFLOP) ** SCORE_EXPONENT
+SCORE_REFERENCE_TFLOP = 10
+SCORE_EXPONENT = -0.035
+
+
+def segmentation_score(miou, compute_tflop, reference_tflop=SCORE_REFERENCE_TFLOP,
+                       exponent=SCORE_EXPONENT):
+    """Score of the segmentation challenge (Assignment 3).
+
+        S = test mIoU (%) x (training compute / 10 TFLOP) ** -0.035
+
+    As in Assignment 2, compute is a soft penalty: doubling the training
+    compute lowers the score by about 2.4 %, and ten times the compute by
+    about 8 %. The exponent is smaller than in Assignment 2 because the mIoU
+    of good designs rises more slowly with compute.
+    """
+    return miou * (compute_tflop / reference_tflop) ** exponent
+
+
+def _size_text(size):
+    """(64, 64) -> 64; (64, 48) -> "64 x 48"."""
+    return size[0] if size[0] == size[1] else f"{size[0]} x {size[1]}"
+
+
 @torch.no_grad()
-def final_segmentation_result(model, history, test_loader, device):
-    """Evaluate the network once on the test set and print the result block.
+def final_segmentation_result(model, history, train_loader, test_loader, device):
+    """Evaluate the network once on the test set and print the result block with the score S.
+
+    The training compute is recalculated here from the network itself (which
+    layers are trained), the size of the training images as they are loaded
+    (after the transforms), the number of training images per epoch and the
+    number of epochs in ``history``:
+
+        training compute = training FLOPs per image x images per epoch x epochs
 
     Returns a dict with all values shown in the block (with the IoU of every class).
     """
@@ -522,22 +624,33 @@ def final_segmentation_result(model, history, test_loader, device):
 
     preds, masks = predict_segmentation(model, test_loader, device)
     metrics = metrics_from_confusion(confusion_matrix(preds, masks))
-    image_size = tuple(masks.shape[1:])
-    cost = compute_cost(model, image_size, device, verbose=False)
-    best = history.best_index() if history.epoch else None
+    train_size = tuple(next(iter(train_loader))[0].shape[-2:])
+    test_size = tuple(next(iter(test_loader))[0].shape[-2:])
+    cost = compute_cost(model, train_size, device, verbose=False)
+    images_per_epoch = len(train_loader.sampler)
+    epochs = len(history.epoch)
+    compute = cost["train_flops"] * images_per_epoch * epochs
+    best = history.best_index() if epochs else None
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else str(device)
     result = {
         "run": history.name,
-        "image size": f"{image_size[0]} x {image_size[1]}",
+        "image size (network input)": _size_text(train_size),
+        **({"test image size": _size_text(test_size)} if test_size != train_size else {}),
+        "masks scored at": _size_text(tuple(masks.shape[1:])),
         "test images": len(masks),
-        "epochs trained": len(history.epoch),
-        "weights from epoch": history.epoch[best] + 1 if history.epoch else None,
-        "val mIoU (%)": round(history.val[best]["mIoU"], 1) if history.epoch else None,
+        "training images per epoch": images_per_epoch,
+        "epochs trained": epochs,
+        "weights from epoch": history.epoch[best] + 1 if epochs else None,
+        "val mIoU (%)": round(history.val[best]["mIoU"], 1) if epochs else None,
         "TEST mIoU (%)": round(metrics["mIoU"], 1),
         "test pixel acc (%)": round(metrics["pixel_acc"], 1),
         "parameters": format_count(cost["params"]),
-        "inference GFLOP per image": round(cost["inference_flops"] / 1e9, 2),
-        "training time (min)": round(history.seconds[-1] / 60, 1) if history.epoch else None,
+        "trained parameters": format_count(cost["trainable_params"]),
+        "inference GFLOP per image": round(cost["inference_flops"] / 1e9, 3),
+        "training GFLOP per image": round(cost["train_flops"] / 1e9, 3),
+        "TRAINING COMPUTE (TFLOP)": round(compute / 1e12, 2),
+        "SCORE S": round(segmentation_score(metrics["mIoU"], compute / 1e12), 1) if compute else None,
+        "training time (min)": round(history.seconds[-1] / 60, 1) if epochs else None,
         "settings": history.config,
         "evaluated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                      + f" on {gpu}",
@@ -547,8 +660,12 @@ def final_segmentation_result(model, history, test_loader, device):
     print(f"{line}\nFINAL RESULT (test set, evaluated once)\n{line}")
     for key, value in result.items():
         print(f"{key:<{width}} : {value}")
-    print("IoU of each class (%):")
-    print("  " + ", ".join(f"{name} {iou:.0f}" for name, iou in metrics["class_iou"].items()))
+    print("IoU of each class (%):  " + ", ".join(f"{name} {iou:.1f}"
+                                                  for name, iou in metrics["class_iou"].items()))
     print(line)
+    if test_size != train_size:
+        print(f"WARNING: the training images ({_size_text(train_size)}) and test images "
+              f"({_size_text(test_size)}) differ in size.\nThe training compute is calculated "
+              "from the size of the training images. Check the size given to the transforms.")
     result["class IoU (%)"] = {k: round(v, 1) for k, v in metrics["class_iou"].items()}
     return result
